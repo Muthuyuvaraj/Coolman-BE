@@ -23,6 +23,19 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def is_placeholder_mongodb_uri(uri: str) -> bool:
+    normalized = uri.strip().lower()
+    return (
+        not normalized
+        or "your_user" in normalized
+        or "your_password" in normalized
+        or "your_cluster" in normalized
+        or "your_app" in normalized
+    )
+
+
 client: MongoClient | None = None
 products_collection: Collection[dict[str, Any]] | None = None
 orders_collection: Collection[dict[str, Any]] | None = None
@@ -153,11 +166,13 @@ def serialize_product(document: dict[str, Any]) -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global client, products_collection, orders_collection, customers_collection, coupons_collection, settings_collection
-    if settings.mongodb_uri:
-        client = MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=5000)
+
+    mongo_client: MongoClient | None = None
+    if settings.mongodb_uri and not is_placeholder_mongodb_uri(settings.mongodb_uri):
+        mongo_client = MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=5000)
         try:
-            client.admin.command("ping")
-            database = client[settings.mongodb_database]
+            mongo_client.admin.command("ping")
+            database = mongo_client[settings.mongodb_database]
             products_collection = database.products
             orders_collection = database.orders
             customers_collection = database.customers
@@ -167,12 +182,27 @@ async def lifespan(_: FastAPI):
             orders_collection.create_index([("orderId", ASCENDING)], unique=True)
             customers_collection.create_index([("email", ASCENDING)], unique=True)
             coupons_collection.create_index([("code", ASCENDING)], unique=True)
+            client = mongo_client
         except PyMongoError as error:
-            client.close()
+            if mongo_client is not None:
+                mongo_client.close()
             client = None
+            products_collection = None
+            orders_collection = None
+            customers_collection = None
+            coupons_collection = None
+            settings_collection = None
             raise RuntimeError(f"Unable to connect to MongoDB Atlas: {error}") from error
+    else:
+        client = None
+        products_collection = None
+        orders_collection = None
+        customers_collection = None
+        coupons_collection = None
+        settings_collection = None
+
     yield
-    if client:
+    if client is not None:
         client.close()
 
 
