@@ -40,6 +40,8 @@ Implemented admin sections:
 - Dashboard with live revenue, order, customer, pending-order, and low-stock metrics.
 - Products with MongoDB-backed create, edit, delete, search, active/inactive, stock, loading, error, and empty states.
 - Product image upload with PNG, JPG, WEBP, and GIF support, preview, and a 2 MB limit.
+- Product editor fields for description, original price, badge, sizes, colors, category, fabric, stock, and image.
+- Product-card Quick View dialog showing image, price, description, fabric, colors, sizes, and a link to full details.
 - Orders with live MongoDB order data, search, status updates, tracking ID editing, and an explicit `Save Changes` button.
 - Customers with live customer totals calculated from MongoDB orders.
 - Coupons with live create, list, active/inactive, expiry, usage limit, and discount data.

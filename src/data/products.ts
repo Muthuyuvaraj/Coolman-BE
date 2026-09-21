@@ -19,6 +19,10 @@ export type Product = {
   category: string;
   badge?: "new" | "sale" | "trending";
   inStock: boolean;
+  stock?: number;
+  active?: boolean;
+  description?: string;
+  colors?: string[];
 };
 
 export const products: Product[] = [

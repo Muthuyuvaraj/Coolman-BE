@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Heart, Eye, ShoppingBag, Star, Check } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { Product } from "@/data/products";
 import { useCart } from "@/contexts/CartContext";
 import { useWishlist } from "@/contexts/WishlistContext";
@@ -18,6 +19,7 @@ export default function ProductCard({ product }: { product: Product }) {
   const liked = isWishlisted(product.id);
   const [selectedSize, setSelectedSize] = useState<string | null>(null);
   const [addedToCart, setAddedToCart] = useState(false);
+  const [quickViewOpen, setQuickViewOpen] = useState(false);
 
   const handleAddToCart = () => {
     const size = selectedSize || product.sizes[0];
@@ -88,6 +90,11 @@ export default function ProductCard({ product }: { product: Product }) {
         {/* Quick View - centered on hover */}
         <div className="absolute inset-0 flex items-center justify-center opacity-0 transition-all duration-300 group-hover:opacity-100">
           <button
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setQuickViewOpen(true);
+            }}
             className="rounded-full bg-card/90 px-5 py-2.5 text-xs font-semibold uppercase tracking-wider text-card-foreground shadow-xl backdrop-blur-md transition-all hover:bg-card hover:scale-105"
             aria-label="Quick view"
           >
@@ -198,6 +205,23 @@ export default function ProductCard({ product }: { product: Product }) {
           </AnimatePresence>
         </motion.button>
       </div>
+
+      <Dialog open={quickViewOpen} onOpenChange={setQuickViewOpen}>
+        <DialogContent className="max-w-2xl overflow-hidden p-0">
+          <div className="grid sm:grid-cols-2">
+            <img src={product.image} alt={product.name} className="h-64 w-full object-cover sm:h-full" />
+            <div className="space-y-4 p-6">
+              <DialogHeader><DialogTitle className="font-display text-2xl">{product.name}</DialogTitle></DialogHeader>
+              <div className="flex items-baseline gap-2"><span className="font-display text-2xl font-extrabold">₹{product.price}</span>{product.originalPrice && <span className="text-sm text-muted-foreground line-through">₹{product.originalPrice}</span>}</div>
+              <p className="text-sm leading-6 text-muted-foreground">{product.description || `Premium quality ${product.name} made with ${product.fabric}.`}</p>
+              <div><p className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Fabric</p><p className="mt-1 text-sm font-medium">{product.fabric}</p></div>
+              <div><p className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Available sizes</p><div className="mt-2 flex flex-wrap gap-2">{product.sizes.map((size) => <span key={size} className="rounded-lg border border-border px-3 py-1 text-xs font-semibold">{size}</span>)}</div></div>
+              {!!product.colors?.length && <div><p className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Colors</p><p className="mt-1 text-sm font-medium">{product.colors.join(", ")}</p></div>}
+              <Link to={`/product/${product.id}`} onClick={() => setQuickViewOpen(false)} className="flex w-full items-center justify-center rounded-xl bg-primary py-3 text-sm font-bold text-primary-foreground">View full details</Link>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </motion.div>
   );
 }

@@ -18,7 +18,7 @@ export default function AdminProductsPage() {
   const [search, setSearch] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<AdminProduct | null>(null);
-  const [form, setForm] = useState({ name: "", price: "", stock: "", category: "", fabric: "", image: "" });
+  const [form, setForm] = useState({ name: "", price: "", originalPrice: "", stock: "", category: "", fabric: "", image: "", description: "", colors: "", sizes: "S, M, L, XL", badge: "" });
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const productsQuery = useQuery({
@@ -40,6 +40,11 @@ export default function AdminProductsPage() {
           category: form.category,
           fabric: form.fabric,
           image: form.image,
+          originalPrice: form.originalPrice ? Number(form.originalPrice) : undefined,
+          description: form.description,
+          colors: form.colors.split(",").map((color) => color.trim()).filter(Boolean),
+          sizes: form.sizes.split(",").map((size) => size.trim()).filter(Boolean),
+          badge: form.badge || undefined,
         });
       }
       const id = `product-${Date.now()}`;
@@ -48,16 +53,18 @@ export default function AdminProductsPage() {
         name: form.name,
         price: Number(form.price),
         image: form.image,
+        originalPrice: form.originalPrice ? Number(form.originalPrice) : undefined,
         rating: 0,
         reviews: 0,
-        sizes: ["S", "M", "L", "XL"],
+        sizes: form.sizes.split(",").map((size) => size.trim()).filter(Boolean),
         fabric: form.fabric,
         category: form.category,
         inStock: Number(form.stock) > 0,
         stock: Number(form.stock),
         active: true,
-        description: `Premium quality ${form.name}`,
-        colors: [],
+        description: form.description || `Premium quality ${form.name}`,
+        colors: form.colors.split(",").map((color) => color.trim()).filter(Boolean),
+        badge: form.badge || undefined,
       });
     },
     onSuccess: () => {
@@ -93,6 +100,11 @@ export default function AdminProductsPage() {
       category: product?.category || "",
       fabric: product?.fabric || "",
       image: product?.image || "",
+      originalPrice: String(product?.originalPrice || ""),
+      description: product?.description || "",
+      colors: product?.colors?.join(", ") || "",
+      sizes: product?.sizes?.join(", ") || "S, M, L, XL",
+      badge: product?.badge || "",
     });
     setDialogOpen(true);
   };
@@ -137,6 +149,10 @@ export default function AdminProductsPage() {
                 <div><Label>Stock Quantity</Label><Input type="number" value={form.stock} onChange={(e) => setForm({ ...form, stock: e.target.value })} placeholder="50" /></div>
               </div>
               <div><Label>Fabric Type</Label><Input value={form.fabric} onChange={(e) => setForm({ ...form, fabric: e.target.value })} placeholder="100% Cotton" /></div>
+              <div><Label>Description</Label><textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Describe the product" className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" /></div>
+              <div className="grid grid-cols-2 gap-4"><div><Label>Original Price (₹)</Label><Input type="number" value={form.originalPrice} onChange={(e) => setForm({ ...form, originalPrice: e.target.value })} placeholder="1299" /></div><div><Label>Badge</Label><Select value={form.badge || "none"} onValueChange={(badge) => setForm({ ...form, badge: badge === "none" ? "" : badge })}><SelectTrigger><SelectValue placeholder="None" /></SelectTrigger><SelectContent><SelectItem value="none">None</SelectItem><SelectItem value="new">New</SelectItem><SelectItem value="sale">Sale</SelectItem><SelectItem value="trending">Trending</SelectItem></SelectContent></Select></div></div>
+              <div><Label>Sizes</Label><Input value={form.sizes} onChange={(e) => setForm({ ...form, sizes: e.target.value })} placeholder="S, M, L, XL" /></div>
+              <div><Label>Colors</Label><Input value={form.colors} onChange={(e) => setForm({ ...form, colors: e.target.value })} placeholder="Black, White" /></div>
               <div>
                 <Label>Product Image</Label>
                 <Input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={(e) => handleImageChange(e.target.files?.[0])} />
