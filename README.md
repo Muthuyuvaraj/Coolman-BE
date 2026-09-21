@@ -9,8 +9,10 @@ Coolman Style Forge is a streetwear storefront with a MongoDB-backed FastAPI bac
 - Premium streetwear storefront with home, shop, offers, wishlist, cart, product details, customize, profile, checkout, and order tracking pages.
 - Updated visual system with a warm off-white background, orange primary color, dark typography, cards, badges, responsive layouts, and custom display fonts.
 - Product cards support sizes, stock state, prices, discounts, ratings, wishlist actions, and add-to-cart behavior.
-- Search, category filtering, price sorting, cart quantity controls, coupon application, delivery calculation, and wishlist support.
+- Navbar search button opens a command palette (powered by `cmdk`) that filters products in real time by name, category, and fabric. Each result shows a thumbnail, price, and rating. Selecting a result navigates to the product detail page. The palette can also be opened with `Ctrl+K` / `Cmd+K`.
+- Category filtering, price sorting, cart quantity controls, coupon application, delivery calculation, and wishlist support.
 - Responsive navigation, footer, mobile layouts, dark/light theme support, animated page sections, and improved loading/error states.
+
 
 ### Customer Accounts and Checkout
 

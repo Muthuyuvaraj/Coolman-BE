@@ -1,6 +1,18 @@
 # Change Log
 
+## 2026-09-21
+
+### Search command palette
+
+- Fixed the navbar search button which previously had no click handler and did nothing.
+- The search button now opens a `cmdk`-powered command palette dialog that lists all products.
+- Products are filtered in real time by name, category, and fabric as the user types.
+- Each search result shows a product thumbnail, name, category, fabric, price, and rating.
+- Selecting a result navigates to the product detail page and closes the dialog.
+- Added `Ctrl+K` / `Cmd+K` keyboard shortcut to open and close the search palette from anywhere.
+
 ## 2026-09-18
+
 
 ### MongoDB Atlas product sync
 
