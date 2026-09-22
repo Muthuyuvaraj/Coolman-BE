@@ -207,7 +207,11 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Coolman Style Forge API", version="1.0.0", lifespan=lifespan)
-allowed_origins = [origin.strip() for origin in settings.frontend_origin.split(",") if origin.strip()]
+allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:8080",
+    "https://cool-man-fe1.onrender.com",
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
