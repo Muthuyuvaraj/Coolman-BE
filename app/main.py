@@ -280,6 +280,26 @@ def delete_product(product_id: str) -> None:
 @app.post("/api/orders", status_code=status.HTTP_201_CREATED)
 def create_order(order: OrderCreate) -> dict[str, Any]:
     collection = require_orders_collection()
+    products = require_collection()
+    requested_stock = Counter(item.productId for item in order.items)
+    for item in order.items:
+        requested_stock[item.productId] += item.quantity - 1
+
+    adjusted_products: list[tuple[str, int]] = []
+    for product_id, quantity in requested_stock.items():
+        result = products.find_one_and_update(
+            {"id": product_id, "active": True, "stock": {"$gte": quantity}},
+            {"$inc": {"stock": -quantity}},
+            projection={"_id": 0, "name": 1},
+            return_document=ReturnDocument.AFTER,
+        )
+        if result is None:
+            for adjusted_id, adjusted_quantity in adjusted_products:
+                products.update_one({"id": adjusted_id}, {"$inc": {"stock": adjusted_quantity}})
+            raise HTTPException(status_code=409, detail=f"Not enough stock available for product {product_id}.")
+        products.update_one({"id": product_id}, {"$set": {"inStock": result.get("stock", 0) > 0}})
+        adjusted_products.append((product_id, quantity))
+
     document = order.model_dump()
     document.update(
         {
@@ -299,6 +319,8 @@ def create_order(order: OrderCreate) -> dict[str, Any]:
             upsert=True,
         )
     except PyMongoError as error:
+        for adjusted_id, adjusted_quantity in adjusted_products:
+            products.update_one({"id": adjusted_id}, {"$inc": {"stock": adjusted_quantity}})
         raise HTTPException(status_code=409, detail=f"Could not create order: {error}") from error
     document.pop("_id", None)
     return document
