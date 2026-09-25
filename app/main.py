@@ -5,7 +5,7 @@ from pathlib import Path
 from uuid import uuid4
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,15 +14,31 @@ from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
 from pymongo import ReturnDocument
 
+from app.whatsapp import WhatsAppNotifier
+
 
 class Settings(BaseSettings):
     mongodb_uri: str = ""
     mongodb_database: str = "coolman"
     frontend_origin: str = "http://localhost:8080"
+    # WhatsApp Cloud API: new orders are pushed to the owner's WhatsApp when a token and sender number ID are set.
+    whatsapp_token: str = ""
+    whatsapp_phone_number_id: str = ""
+    # Owner's number; falls back to the phone saved in admin Settings.
+    whatsapp_owner_number: str = ""
+    # Approved template (image header + one body variable) so alerts arrive even outside the 24-hour chat window.
+    whatsapp_template: str = ""
+    whatsapp_template_language: str = "en"
     model_config = SettingsConfigDict(env_file=Path(__file__).resolve().parents[1] / ".env", extra="ignore")
 
 
 settings = Settings()
+whatsapp = WhatsAppNotifier(
+    settings.whatsapp_token,
+    settings.whatsapp_phone_number_id,
+    settings.whatsapp_template,
+    settings.whatsapp_template_language,
+)
 
 
 def is_placeholder_mongodb_uri(uri: str) -> bool:
@@ -89,6 +105,8 @@ class OrderItem(BaseModel):
     size: str
     quantity: int = Field(gt=0)
     price: float = Field(ge=0)
+    # Public product photo URL, sent to the owner on WhatsApp.
+    image: str | None = None
 
 
 class OrderCreate(BaseModel):
@@ -277,12 +295,17 @@ def delete_product(product_id: str) -> None:
         raise HTTPException(status_code=404, detail="Product not found")
 
 
+CUSTOM_PRODUCT_PREFIX = "custom-"
+
+
 @app.post("/api/orders", status_code=status.HTTP_201_CREATED)
-def create_order(order: OrderCreate) -> dict[str, Any]:
+def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[str, Any]:
     collection = require_orders_collection()
     products = require_collection()
-    requested_stock = Counter(item.productId for item in order.items)
-    for item in order.items:
+    # Made-to-order custom tees are not catalogue products, so they have no stock to reserve.
+    stocked_items = [item for item in order.items if not item.productId.startswith(CUSTOM_PRODUCT_PREFIX)]
+    requested_stock = Counter(item.productId for item in stocked_items)
+    for item in stocked_items:
         requested_stock[item.productId] += item.quantity - 1
 
     adjusted_products: list[tuple[str, int]] = []
@@ -323,7 +346,16 @@ def create_order(order: OrderCreate) -> dict[str, Any]:
             products.update_one({"id": adjusted_id}, {"$inc": {"stock": adjusted_quantity}})
         raise HTTPException(status_code=409, detail=f"Could not create order: {error}") from error
     document.pop("_id", None)
+    if whatsapp.configured:
+        background_tasks.add_task(notify_owner_of_order, dict(document))
     return document
+
+
+def notify_owner_of_order(order: dict[str, Any]) -> None:
+    owner_phone = settings.whatsapp_owner_number
+    if not owner_phone and settings_collection is not None:
+        owner_phone = (settings_collection.find_one({"key": "store"}, {"_id": 0, "phone": 1}) or {}).get("phone")
+    whatsapp.notify_new_order(order, owner_phone)
 
 
 @app.get("/api/admin/orders")
@@ -380,6 +412,28 @@ def create_customer(customer: CustomerCreate) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=f"Could not save customer: {error}") from error
     document.pop("_id", None)
     return document
+
+
+class NewsletterSignup(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+@app.post("/api/newsletter", status_code=status.HTTP_201_CREATED)
+def subscribe_newsletter(signup: NewsletterSignup) -> dict[str, Any]:
+    if client is None:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured for newsletter.")
+    email = signup.email.strip().lower()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    try:
+        client[settings.mongodb_database].newsletter.update_one(
+            {"email": email},
+            {"$setOnInsert": {"email": email, "createdAt": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+    except PyMongoError as error:
+        raise HTTPException(status_code=409, detail=f"Could not save subscription: {error}") from error
+    return {"email": email}
 
 
 @app.get("/api/admin/coupons")
