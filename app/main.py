@@ -346,8 +346,7 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
             products.update_one({"id": adjusted_id}, {"$inc": {"stock": adjusted_quantity}})
         raise HTTPException(status_code=409, detail=f"Could not create order: {error}") from error
     document.pop("_id", None)
-    if whatsapp.configured:
-        background_tasks.add_task(notify_owner_of_order, dict(document))
+    background_tasks.add_task(notify_owner_of_order, dict(document))
     return document
 
 
@@ -355,7 +354,19 @@ def notify_owner_of_order(order: dict[str, Any]) -> None:
     owner_phone = settings.whatsapp_owner_number
     if not owner_phone and settings_collection is not None:
         owner_phone = (settings_collection.find_one({"key": "store"}, {"_id": 0, "phone": 1}) or {}).get("phone")
-    whatsapp.notify_new_order(order, owner_phone)
+    whatsapp.notify_new_order(order, owner_phone, order_item_images(order))
+
+
+def order_item_images(order: dict[str, Any]) -> list[str | None]:
+    """Each item's photo, preferring the catalogue image (usually an uploaded data URL) over the URL sent by checkout."""
+    stored: dict[str, str] = {}
+    if products_collection is not None:
+        product_ids = list({item["productId"] for item in order["items"]})
+        try:
+            stored = {p["id"]: p.get("image", "") for p in products_collection.find({"id": {"$in": product_ids}}, {"_id": 0, "id": 1, "image": 1})}
+        except PyMongoError:
+            pass
+    return [stored.get(item["productId"]) or item.get("image") for item in order["items"]]
 
 
 @app.get("/api/admin/orders")
