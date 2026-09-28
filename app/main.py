@@ -350,11 +350,21 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
     return document
 
 
-def notify_owner_of_order(order: dict[str, Any]) -> None:
+def owner_whatsapp_phone() -> str | None:
     owner_phone = settings.whatsapp_owner_number
     if not owner_phone and settings_collection is not None:
         owner_phone = (settings_collection.find_one({"key": "store"}, {"_id": 0, "phone": 1}) or {}).get("phone")
-    whatsapp.notify_new_order(order, owner_phone, order_item_images(order))
+    return owner_phone
+
+
+def notify_owner_of_order(order: dict[str, Any]) -> None:
+    whatsapp.notify_new_order(order, owner_whatsapp_phone(), order_item_images(order))
+
+
+@app.post("/api/admin/whatsapp/test")
+def test_whatsapp() -> dict[str, Any]:
+    """Sends a test alert to the owner and returns Meta's reply, to see why order alerts aren't arriving."""
+    return whatsapp.diagnose(owner_whatsapp_phone())
 
 
 def order_item_images(order: dict[str, Any]) -> list[str | None]:

@@ -180,3 +180,35 @@ class WhatsAppNotifier:
         sent = self._attempt("order text", order_id, lambda: self._send({"to": to, "type": "text", "text": {"body": build_order_text(order)}}))
         if sent is not None:
             logger.info("WhatsApp order alert for %s sent to %s with %d photo(s).", order_id, to, len(photos))
+
+    def diagnose(self, owner_phone: str | None) -> dict[str, Any]:
+        """Sends Meta's built-in hello_world template and a plain text, returning Meta's raw reply for each.
+
+        hello_world is exempt from the 24-hour window, so if it arrives but the text doesn't, the owner needs to
+        message the business number first (or WHATSAPP_TEMPLATE must be set).
+        """
+        to = to_whatsapp_number(owner_phone)
+        report: dict[str, Any] = {
+            "tokenSet": bool(self.token),
+            "phoneNumberIdSet": bool(self.phone_number_id),
+            "to": to or None,
+            "template": self.template or None,
+        }
+        if not self.configured or not to:
+            return report
+
+        def attempt(payload: dict[str, Any]) -> dict[str, Any]:
+            try:
+                return {"ok": True, "response": self._send({"to": to, **payload})}
+            except HTTPError as error:
+                body = error.read().decode(errors="replace")
+                try:
+                    return {"ok": False, "status": error.code, "error": json.loads(body).get("error", body)}
+                except ValueError:
+                    return {"ok": False, "status": error.code, "error": body}
+            except (URLError, TimeoutError) as error:
+                return {"ok": False, "error": str(error)}
+
+        report["helloWorldTemplate"] = attempt({"type": "template", "template": {"name": "hello_world", "language": {"code": "en_US"}}})
+        report["textMessage"] = attempt({"type": "text", "text": {"body": "Coolman test: order alerts are connected."}})
+        return report
