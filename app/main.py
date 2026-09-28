@@ -105,7 +105,7 @@ class OrderItem(BaseModel):
     size: str
     quantity: int = Field(gt=0)
     price: float = Field(ge=0)
-    # Public product photo URL, sent to the owner on WhatsApp.
+    # Product photo (JPEG data URL, or a public URL) for the owner's WhatsApp alert; not stored on the order.
     image: str | None = None
 
 
@@ -324,6 +324,8 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
         adjusted_products.append((product_id, quantity))
 
     document = order.model_dump()
+    # Checkout sends each photo inline for the WhatsApp alert only; keep it out of the stored order.
+    checkout_images = [item.pop("image", None) for item in document["items"]]
     document.update(
         {
             "orderId": f"CM-{datetime.now(timezone.utc):%Y%m%d%H%M%S}",
@@ -346,7 +348,7 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
             products.update_one({"id": adjusted_id}, {"$inc": {"stock": adjusted_quantity}})
         raise HTTPException(status_code=409, detail=f"Could not create order: {error}") from error
     document.pop("_id", None)
-    background_tasks.add_task(notify_owner_of_order, dict(document))
+    background_tasks.add_task(notify_owner_of_order, dict(document), checkout_images)
     return document
 
 
@@ -357,8 +359,8 @@ def owner_whatsapp_phone() -> str | None:
     return owner_phone
 
 
-def notify_owner_of_order(order: dict[str, Any]) -> None:
-    whatsapp.notify_new_order(order, owner_whatsapp_phone(), order_item_images(order))
+def notify_owner_of_order(order: dict[str, Any], checkout_images: list[str | None]) -> None:
+    whatsapp.notify_new_order(order, owner_whatsapp_phone(), order_item_images(order, checkout_images))
 
 
 @app.post("/api/admin/whatsapp/test")
@@ -367,8 +369,8 @@ def test_whatsapp() -> dict[str, Any]:
     return whatsapp.diagnose(owner_whatsapp_phone())
 
 
-def order_item_images(order: dict[str, Any]) -> list[str | None]:
-    """Each item's photo, preferring the catalogue image (usually an uploaded data URL) over the URL sent by checkout."""
+def order_item_images(order: dict[str, Any], checkout_images: list[str | None]) -> list[list[str]]:
+    """Candidate photos per item, tried in order: the JPEG checkout sends, then the catalogue image."""
     stored: dict[str, str] = {}
     if products_collection is not None:
         product_ids = list({item["productId"] for item in order["items"]})
@@ -376,7 +378,10 @@ def order_item_images(order: dict[str, Any]) -> list[str | None]:
             stored = {p["id"]: p.get("image", "") for p in products_collection.find({"id": {"$in": product_ids}}, {"_id": 0, "id": 1, "image": 1})}
         except PyMongoError:
             pass
-    return [stored.get(item["productId"]) or item.get("image") for item in order["items"]]
+    return [
+        [source for source in (checkout_image, stored.get(item["productId"])) if source]
+        for item, checkout_image in zip(order["items"], checkout_images)
+    ]
 
 
 @app.get("/api/admin/orders")

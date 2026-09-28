@@ -137,12 +137,16 @@ class WhatsAppNotifier:
             logger.error("WhatsApp %s for %s failed: %s", what, order_id, error)
         return None
 
-    def _photo_ids(self, order: dict[str, Any], image_sources: list[str | None]) -> list[tuple[str, str]]:
+    def _photo_ids(self, order: dict[str, Any], image_sources: list[list[str]]) -> list[tuple[str, str]]:
         """(media id, caption) for every order item whose photo could be read and uploaded."""
         order_id = order.get("orderId", "")
         photos = []
-        for index, (item, source) in enumerate(zip(order["items"], image_sources), start=1):
-            image = self._attempt(f"photo read ({item['name']})", order_id, lambda: load_image(source or ""))
+        for index, (item, sources) in enumerate(zip(order["items"], image_sources), start=1):
+            image = None
+            for source in sources:
+                image = self._attempt(f"photo read ({item['name']})", order_id, lambda: load_image(source))
+                if image:
+                    break
             if not image:
                 logger.warning("WhatsApp alert for %s: no JPEG/PNG photo for %s, skipping it.", order_id, item["name"])
                 continue
@@ -151,10 +155,10 @@ class WhatsAppNotifier:
                 photos.append((media_id, photo_caption(index, item)))
         return photos
 
-    def notify_new_order(self, order: dict[str, Any], owner_phone: str | None, image_sources: list[str | None]) -> None:
+    def notify_new_order(self, order: dict[str, Any], owner_phone: str | None, image_sources: list[list[str]]) -> None:
         """Runs after the response is sent; failures are logged, never raised, so they can't affect the order.
 
-        image_sources holds one photo per order item: a data URL or an http(s) URL, or None.
+        image_sources holds, per order item, candidate photos (data URLs or http(s) URLs); the first usable one is sent.
         """
         order_id = order.get("orderId", "")
         if not self.configured:
