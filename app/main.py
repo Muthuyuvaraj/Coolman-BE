@@ -212,6 +212,9 @@ async def lifespan(_: FastAPI):
             order_images_collection = database.order_images
             order_images_collection.create_index([("id", ASCENDING)], unique=True)
             products_collection.create_index([("id", ASCENDING)], unique=True)
+            # Repair products an older order bug marked sold out while they still had stock.
+            products_collection.update_many({"stock": {"$gt": 0}, "inStock": False}, {"$set": {"inStock": True}})
+            products_collection.update_many({"stock": {"$lte": 0}, "inStock": True}, {"$set": {"inStock": False}})
             orders_collection.create_index([("orderId", ASCENDING)], unique=True)
             customers_collection.create_index([("email", ASCENDING)], unique=True)
             coupons_collection.create_index([("code", ASCENDING)], unique=True)
@@ -278,6 +281,7 @@ def list_admin_products() -> list[dict[str, Any]]:
 def create_product(product: Product) -> dict[str, Any]:
     collection = require_collection()
     document = product.model_dump()
+    document["inStock"] = document["stock"] > 0
     document["updatedAt"] = datetime.now(timezone.utc)
     try:
         collection.insert_one(document)
@@ -292,6 +296,9 @@ def update_product(product_id: str, update: ProductUpdate) -> dict[str, Any]:
     changes = {key: value for key, value in update.model_dump().items() if value is not None}
     if not changes:
         raise HTTPException(status_code=400, detail="No product changes supplied")
+    # Stock is the source of truth for availability.
+    if "stock" in changes:
+        changes["inStock"] = changes["stock"] > 0
     changes["updatedAt"] = datetime.now(timezone.utc)
     result = collection.find_one_and_update(
         {"id": product_id},
@@ -335,7 +342,7 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
         result = products.find_one_and_update(
             {"id": product_id, "active": True, "stock": {"$gte": quantity}},
             {"$inc": {"stock": -quantity}},
-            projection={"_id": 0, "name": 1},
+            projection={"_id": 0, "stock": 1},
             return_document=ReturnDocument.AFTER,
         )
         if result is None:
