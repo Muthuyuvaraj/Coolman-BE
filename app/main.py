@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from collections import Counter
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from uuid import uuid4
 from typing import Any, Literal
 
@@ -18,7 +18,7 @@ from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
 from pymongo import ReturnDocument
 
-from app.whatsapp import WhatsAppNotifier
+from app.whatsapp import WhatsAppNotifier, build_order_text, to_whatsapp_number
 
 
 class Settings(BaseSettings):
@@ -386,7 +386,12 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
             coupons_collection.update_one({"code": coupon_code}, {"$inc": {"usedCount": -1}})
         raise HTTPException(status_code=409, detail=f"Could not create order: {error}") from error
     document.pop("_id", None)
-    background_tasks.add_task(notify_owner_of_order, dict(document), checkout_images)
+    image_links = order_image_links(document, order_item_images(document, checkout_images))
+    background_tasks.add_task(notify_owner_of_order, dict(document), image_links)
+    # Click-to-chat link: the customer sends the order (with photo links) to the owner's WhatsApp in one tap.
+    owner_number = to_whatsapp_number(owner_whatsapp_phone())
+    if owner_number:
+        document["whatsappUrl"] = f"https://wa.me/{owner_number}?text={quote(build_order_text(document, image_links))}"
     return document
 
 
@@ -397,8 +402,9 @@ def owner_whatsapp_phone() -> str | None:
     return owner_phone
 
 
-def notify_owner_of_order(order: dict[str, Any], checkout_images: list[str | None]) -> None:
-    whatsapp.notify_new_order(order, owner_whatsapp_phone(), order_image_links(order, order_item_images(order, checkout_images)))
+def notify_owner_of_order(order: dict[str, Any], image_links: list[str | None]) -> None:
+    """Automatic alert through the WhatsApp Cloud API; a no-op until WHATSAPP_TOKEN / WHATSAPP_PHONE_NUMBER_ID are set."""
+    whatsapp.notify_new_order(order, owner_whatsapp_phone(), image_links)
 
 
 def public_base_url() -> str:
