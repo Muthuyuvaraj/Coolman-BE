@@ -1,11 +1,15 @@
+import base64
+import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,10 +29,14 @@ class Settings(BaseSettings):
     whatsapp_token: str = ""
     whatsapp_phone_number_id: str = ""
     # Owner's number; falls back to the phone saved in admin Settings.
-    whatsapp_owner_number: str = ""
+    whatsapp_owner_number: str = "917200250454"
     # Approved template (image header + one body variable) so alerts arrive even outside the 24-hour chat window.
     whatsapp_template: str = ""
     whatsapp_template_language: str = "en"
+    # Public address of this backend, used to build the order photo links WhatsApp downloads.
+    # Render sets RENDER_EXTERNAL_URL automatically, so this only needs setting elsewhere (e.g. an ngrok URL locally).
+    public_base_url: str = ""
+    render_external_url: str = ""
     model_config = SettingsConfigDict(env_file=Path(__file__).resolve().parents[1] / ".env", extra="ignore")
 
 
@@ -58,6 +66,7 @@ orders_collection: Collection[dict[str, Any]] | None = None
 customers_collection: Collection[dict[str, Any]] | None = None
 coupons_collection: Collection[dict[str, Any]] | None = None
 settings_collection: Collection[dict[str, Any]] | None = None
+order_images_collection: Collection[dict[str, Any]] | None = None
 
 
 class Product(BaseModel):
@@ -183,7 +192,7 @@ def serialize_product(document: dict[str, Any]) -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global client, products_collection, orders_collection, customers_collection, coupons_collection, settings_collection
+    global client, products_collection, orders_collection, customers_collection, coupons_collection, settings_collection, order_images_collection
 
     mongo_client: MongoClient | None = None
     if settings.mongodb_uri and not is_placeholder_mongodb_uri(settings.mongodb_uri):
@@ -196,6 +205,8 @@ async def lifespan(_: FastAPI):
             customers_collection = database.customers
             coupons_collection = database.coupons
             settings_collection = database.settings
+            order_images_collection = database.order_images
+            order_images_collection.create_index([("id", ASCENDING)], unique=True)
             products_collection.create_index([("id", ASCENDING)], unique=True)
             orders_collection.create_index([("orderId", ASCENDING)], unique=True)
             customers_collection.create_index([("email", ASCENDING)], unique=True)
@@ -210,6 +221,7 @@ async def lifespan(_: FastAPI):
             customers_collection = None
             coupons_collection = None
             settings_collection = None
+            order_images_collection = None
             raise RuntimeError(f"Unable to connect to MongoDB Atlas: {error}") from error
     else:
         client = None
@@ -218,6 +230,7 @@ async def lifespan(_: FastAPI):
         customers_collection = None
         coupons_collection = None
         settings_collection = None
+        order_images_collection = None
 
     yield
     if client is not None:
@@ -296,6 +309,8 @@ def delete_product(product_id: str) -> None:
 
 
 CUSTOM_PRODUCT_PREFIX = "custom-"
+# WhatsApp image messages accept only JPEG and PNG.
+DATA_IMAGE_PATTERN = re.compile(r"data:image/(jpeg|jpg|png);base64,(.+)", re.DOTALL)
 
 
 @app.post("/api/orders", status_code=status.HTTP_201_CREATED)
@@ -360,7 +375,55 @@ def owner_whatsapp_phone() -> str | None:
 
 
 def notify_owner_of_order(order: dict[str, Any], checkout_images: list[str | None]) -> None:
-    whatsapp.notify_new_order(order, owner_whatsapp_phone(), order_item_images(order, checkout_images))
+    whatsapp.notify_new_order(order, owner_whatsapp_phone(), order_image_links(order, order_item_images(order, checkout_images)))
+
+
+def public_base_url() -> str:
+    return (settings.public_base_url or settings.render_external_url).rstrip("/")
+
+
+def is_public_url(url: str) -> bool:
+    host = urlparse(url).hostname or ""
+    return url.startswith(("http://", "https://")) and host not in {"localhost", "127.0.0.1", "0.0.0.0"} and not host.endswith(".local")
+
+
+def order_image_links(order: dict[str, Any], candidates: list[list[str]]) -> list[str | None]:
+    """One public JPEG/PNG link per item for WhatsApp to download.
+
+    Inline photos (data URLs) are saved and served from /api/order-images/{id}; public URLs are used as they are.
+    """
+    base = public_base_url()
+    links: list[str | None] = []
+    for sources in candidates:
+        link = None
+        for source in sources:
+            match = DATA_IMAGE_PATTERN.match(source)
+            if match and base and order_images_collection is not None:
+                image_id = uuid4().hex
+                try:
+                    order_images_collection.insert_one(
+                        {"id": image_id, "orderId": order["orderId"], "mime": "image/png" if match.group(1) == "png" else "image/jpeg", "data": base64.b64decode(match.group(2)), "createdAt": order["createdAt"]}
+                    )
+                except (PyMongoError, ValueError):
+                    continue
+                link = f"{base}/api/order-images/{image_id}"
+                break
+            if is_public_url(source):
+                link = source
+                break
+        links.append(link)
+    if not base and not all(links):
+        logging.getLogger(__name__).warning("Order %s: set PUBLIC_BASE_URL so WhatsApp can load uploaded product photos.", order["orderId"])
+    return links
+
+
+@app.get("/api/order-images/{image_id}")
+def get_order_image(image_id: str) -> Response:
+    """Public so WhatsApp can fetch it; ids are random 128-bit tokens."""
+    image = require_resource_collection(order_images_collection, "order images").find_one({"id": image_id}, {"_id": 0, "mime": 1, "data": 1})
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return Response(content=bytes(image["data"]), media_type=image["mime"], headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.post("/api/admin/whatsapp/test")
