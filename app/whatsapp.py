@@ -44,6 +44,8 @@ def build_order_text(order: dict[str, Any], image_links: list[str | None] | None
         lines.append(f"   Size {item['size']} × {item['quantity']} = {format_price(item['price'] * item['quantity'])}")
         if index <= len(links) and links[index - 1]:
             lines.append(f"   Photo: {links[index - 1]}")
+        if item.get("artworkUrl"):
+            lines.append(f"   Customer's picture: {item['artworkUrl']}")
     lines += ["", f"Subtotal: {format_price(order['subtotal'])}"]
     if order["discount"] > 0:
         coupon = f" ({order['couponCode']})" if order.get("couponCode") else ""
@@ -114,6 +116,7 @@ class WhatsAppNotifier:
             logger.warning("WhatsApp order alert skipped for %s: no owner phone number configured.", order_id)
             return
         photos = [(link, photo_caption(index, item)) for index, (item, link) in enumerate(zip(order["items"], image_links), start=1) if link]
+        artwork = [(item["artworkUrl"], f"{index}. Customer's uploaded picture") for index, item in enumerate(order["items"], start=1) if item.get("artworkUrl")]
         if len(photos) < len(order["items"]):
             logger.warning("WhatsApp alert for %s: %d item(s) have no public photo link.", order_id, len(order["items"]) - len(photos))
         if self.template:
@@ -126,7 +129,7 @@ class WhatsAppNotifier:
             if self._attempt("template alert", order_id, lambda: self._send({"to": to, "type": "template", "template": template})) is None:
                 return
             photos = photos[1:]
-        for link, caption in photos:
+        for link, caption in photos + artwork:
             self._attempt("photo message", order_id, lambda: self._send({"to": to, "type": "image", "image": {"link": link, "caption": caption}}))
         text = build_order_text(order, image_links)
         sent = self._attempt("order text", order_id, lambda: self._send({"to": to, "type": "text", "text": {"body": text, "preview_url": True}}))

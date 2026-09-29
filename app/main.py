@@ -9,7 +9,7 @@ from urllib.parse import quote, urlparse
 from uuid import uuid4
 from typing import Any, Literal
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Response, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -116,6 +116,13 @@ class OrderItem(BaseModel):
     price: float = Field(ge=0)
     # Product photo (JPEG data URL, or a public URL) for the owner's WhatsApp alert; not stored on the order.
     image: str | None = None
+    # Custom tees: link to the customer's original uploaded picture (from /api/design-uploads), kept on the order.
+    artworkUrl: str | None = Field(default=None, max_length=500)
+
+
+class DesignUpload(BaseModel):
+    # JPEG or PNG data URL; ~10 MB of image once decoded.
+    image: str = Field(max_length=14_000_000)
 
 
 class OrderCreate(BaseModel):
@@ -322,6 +329,40 @@ def delete_product(product_id: str) -> None:
 CUSTOM_PRODUCT_PREFIX = "custom-"
 # WhatsApp image messages accept only JPEG and PNG.
 DATA_IMAGE_PATTERN = re.compile(r"data:image/(jpeg|jpg|png);base64,(.+)", re.DOTALL)
+MAX_DESIGN_UPLOAD_BYTES = 10 * 1024 * 1024
+ORDER_IMAGE_PATH = "/api/order-images/"
+
+
+@app.post("/api/design-uploads", status_code=status.HTTP_201_CREATED)
+def upload_design(upload: DesignUpload, request: Request) -> dict[str, str]:
+    """Stores a customer's picture for a custom tee at full quality and returns a public link to it for the owner."""
+    collection = require_resource_collection(order_images_collection, "order images")
+    match = DATA_IMAGE_PATTERN.match(upload.image)
+    if not match:
+        raise HTTPException(status_code=422, detail="Upload a JPEG or PNG image.")
+    try:
+        data = base64.b64decode(match.group(2), validate=True)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="The image could not be read.") from error
+    if len(data) > MAX_DESIGN_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Image is too large (max 10 MB).")
+    image_id = uuid4().hex
+    try:
+        collection.insert_one(
+            {"id": image_id, "kind": "design", "orderId": None, "mime": "image/png" if match.group(1) == "png" else "image/jpeg", "data": data, "createdAt": datetime.now(timezone.utc)}
+        )
+    except PyMongoError as error:
+        raise HTTPException(status_code=503, detail="Could not save the image. Please try again.") from error
+    base = public_base_url() or str(request.base_url).rstrip("/")
+    return {"url": f"{base}{ORDER_IMAGE_PATH}{image_id}"}
+
+
+def design_upload_id(url: str | None) -> str | None:
+    """The stored image id behind a link returned by /api/design-uploads, or None for anything else."""
+    if not url or ORDER_IMAGE_PATH not in url:
+        return None
+    image_id = url.rsplit("/", 1)[-1]
+    return image_id if re.fullmatch(r"[0-9a-f]{32}", image_id) else None
 
 
 @app.post("/api/orders", status_code=status.HTTP_201_CREATED)
@@ -393,6 +434,13 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
             coupons_collection.update_one({"code": coupon_code}, {"$inc": {"usedCount": -1}})
         raise HTTPException(status_code=409, detail=f"Could not create order: {error}") from error
     document.pop("_id", None)
+    # Tie the customer's uploaded pictures to this order so they can be told apart from abandoned uploads.
+    artwork_ids = [image_id for image_id in (design_upload_id(item.get("artworkUrl")) for item in document["items"]) if image_id]
+    if artwork_ids and order_images_collection is not None:
+        try:
+            order_images_collection.update_many({"id": {"$in": artwork_ids}, "kind": "design"}, {"$set": {"orderId": document["orderId"]}})
+        except PyMongoError:
+            logging.getLogger(__name__).warning("Order %s: could not link uploaded pictures.", document["orderId"])
     image_links = order_image_links(document, order_item_images(document, checkout_images))
     background_tasks.add_task(notify_owner_of_order, dict(document), image_links)
     # Click-to-chat link: the customer sends the order (with photo links) to the owner's WhatsApp in one tap.
