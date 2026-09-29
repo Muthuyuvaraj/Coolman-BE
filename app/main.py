@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -153,6 +153,10 @@ class CouponCreate(BaseModel):
 
 class CouponUpdate(BaseModel):
     active: bool | None = None
+
+
+class CustomerStatusUpdate(BaseModel):
+    status: Literal["active", "blocked"]
 
 
 class StoreSettings(BaseModel):
@@ -317,6 +321,9 @@ DATA_IMAGE_PATTERN = re.compile(r"data:image/(jpeg|jpg|png);base64,(.+)", re.DOT
 def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[str, Any]:
     collection = require_orders_collection()
     products = require_collection()
+    customers = require_resource_collection(customers_collection, "customers")
+    if customers.find_one({"email": order.customerEmail.lower(), "status": "blocked"}, {"_id": 1}):
+        raise HTTPException(status_code=403, detail="This account can't place orders. Please contact support.")
     # Made-to-order custom tees are not catalogue products, so they have no stock to reserve.
     stocked_items = [item for item in order.items if not item.productId.startswith(CUSTOM_PRODUCT_PREFIX)]
     requested_stock = Counter(item.productId for item in stocked_items)
@@ -338,7 +345,23 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
         products.update_one({"id": product_id}, {"$set": {"inStock": result.get("stock", 0) > 0}})
         adjusted_products.append((product_id, quantity))
 
+    def restore_stock() -> None:
+        for adjusted_id, adjusted_quantity in adjusted_products:
+            products.update_one({"id": adjusted_id}, {"$inc": {"stock": adjusted_quantity}})
+
+    coupon_code = order.couponCode.strip().upper() if order.couponCode else None
+    if coupon_code:
+        claimed = require_resource_collection(coupons_collection, "coupons").find_one_and_update(
+            {**available_coupon_filter(), "code": coupon_code},
+            {"$inc": {"usedCount": 1}},
+            projection={"_id": 1},
+        )
+        if claimed is None:
+            restore_stock()
+            raise HTTPException(status_code=409, detail=f"Coupon {coupon_code} is no longer valid. Remove it and try again.")
+
     document = order.model_dump()
+    document["couponCode"] = coupon_code
     # Checkout sends each photo inline for the WhatsApp alert only; keep it out of the stored order.
     checkout_images = [item.pop("image", None) for item in document["items"]]
     document.update(
@@ -352,15 +375,15 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
     )
     try:
         collection.insert_one(document)
-        customers = require_resource_collection(customers_collection, "customers")
         customers.update_one(
             {"email": order.customerEmail.lower()},
             {"$set": {"name": order.customerName, "phone": order.phone, "updatedAt": document["createdAt"]}, "$setOnInsert": {"email": order.customerEmail.lower(), "createdAt": document["createdAt"]}},
             upsert=True,
         )
     except PyMongoError as error:
-        for adjusted_id, adjusted_quantity in adjusted_products:
-            products.update_one({"id": adjusted_id}, {"$inc": {"stock": adjusted_quantity}})
+        restore_stock()
+        if coupon_code:
+            coupons_collection.update_one({"code": coupon_code}, {"$inc": {"usedCount": -1}})
         raise HTTPException(status_code=409, detail=f"Could not create order: {error}") from error
     document.pop("_id", None)
     background_tasks.add_task(notify_owner_of_order, dict(document), checkout_images)
@@ -488,15 +511,29 @@ def list_admin_customers() -> list[dict[str, Any]]:
         entry = totals.setdefault(email, {"orders": 0, "spent": 0})
         entry["orders"] += 1
         entry["spent"] += order.get("total", 0)
-    return [{**customer, "totalOrders": int(totals.get(customer["email"], {}).get("orders", 0)), "totalSpent": totals.get(customer["email"], {}).get("spent", 0), "status": "active"} for customer in documents]
+    return [{**customer, "totalOrders": int(totals.get(customer["email"], {}).get("orders", 0)), "totalSpent": totals.get(customer["email"], {}).get("spent", 0), "status": customer.get("status", "active")} for customer in documents]
+
+
+@app.patch("/api/admin/customers/{email}")
+def update_customer_status(email: str, update: CustomerStatusUpdate) -> dict[str, Any]:
+    result = require_resource_collection(customers_collection, "customers").find_one_and_update(
+        {"email": email.lower()}, {"$set": {"status": update.status}}, projection={"_id": 0}, return_document=ReturnDocument.AFTER
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return result
 
 
 @app.post("/api/customers", status_code=status.HTTP_201_CREATED)
 def create_customer(customer: CustomerCreate) -> dict[str, Any]:
     collection = require_resource_collection(customers_collection, "customers")
-    document = {**customer.model_dump(), "email": customer.email.lower(), "status": "active", "createdAt": datetime.now(timezone.utc)}
+    document = {**customer.model_dump(), "email": customer.email.lower()}
     try:
-        collection.update_one({"email": document["email"]}, {"$set": document}, upsert=True)
+        collection.update_one(
+            {"email": document["email"]},
+            {"$set": document, "$setOnInsert": {"status": "active", "createdAt": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
     except PyMongoError as error:
         raise HTTPException(status_code=409, detail=f"Could not save customer: {error}") from error
     document.pop("_id", None)
@@ -523,6 +560,32 @@ def subscribe_newsletter(signup: NewsletterSignup) -> dict[str, Any]:
     except PyMongoError as error:
         raise HTTPException(status_code=409, detail=f"Could not save subscription: {error}") from error
     return {"email": email}
+
+
+def available_coupon_filter() -> dict[str, Any]:
+    """Coupons shoppers can use: switched on, not past expiry (YYYY-MM-DD), and under their usage limit."""
+    return {
+        "active": True,
+        "expiryDate": {"$gte": datetime.now(timezone.utc).date().isoformat()},
+        "$expr": {"$lt": [{"$ifNull": ["$usedCount", 0]}, "$usageLimit"]},
+    }
+
+
+PUBLIC_COUPON_FIELDS = {"_id": 0, "code": 1, "discountType": 1, "discountValue": 1, "expiryDate": 1}
+
+
+@app.get("/api/coupons")
+def list_available_coupons() -> list[dict[str, Any]]:
+    collection = require_resource_collection(coupons_collection, "coupons")
+    return list(collection.find(available_coupon_filter(), PUBLIC_COUPON_FIELDS).sort("createdAt", -1))
+
+
+@app.get("/api/coupons/{code}")
+def get_available_coupon(code: str) -> dict[str, Any]:
+    coupon = require_resource_collection(coupons_collection, "coupons").find_one({**available_coupon_filter(), "code": code.strip().upper()}, PUBLIC_COUPON_FIELDS)
+    if coupon is None:
+        raise HTTPException(status_code=404, detail="Invalid or expired coupon code")
+    return coupon
 
 
 @app.get("/api/admin/coupons")
