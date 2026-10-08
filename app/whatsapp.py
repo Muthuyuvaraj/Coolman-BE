@@ -34,7 +34,7 @@ def build_order_text(order: dict[str, Any], image_links: list[str | None] | None
         "",
         f"*Customer:* {order['customerName']}",
         f"*Phone:* {order['phone']}",
-        f"*Email:* {order['customerEmail']}",
+        *([f"*Email:* {order['customerEmail']}"] if order.get("customerEmail") else []),
         f"*Address:* {order['address']}",
         "",
         "*Items*",

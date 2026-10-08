@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pymongo import ASCENDING, MongoClient
 from pymongo.collection import Collection
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 from pymongo import ReturnDocument
 
 from app.whatsapp import WhatsAppNotifier, build_order_text, to_whatsapp_number
@@ -125,9 +125,14 @@ class DesignUpload(BaseModel):
     image: str = Field(max_length=14_000_000)
 
 
+ORDER_ID_PATTERN = r"^CM-\d{14}-[0-9A-F]{4}$"
+TRACKING_ID_PATTERN = r"^TRK-[0-9A-F]{10}$"
+
+
 class OrderCreate(BaseModel):
     customerName: str = Field(min_length=1)
-    customerEmail: str = Field(min_length=3)
+    # Optional: guests order without an account. When given, the order shows up in that account's profile.
+    customerEmail: str = Field(default="", max_length=254)
     phone: str = Field(min_length=5)
     address: str = Field(min_length=5)
     items: list[OrderItem] = Field(min_length=1)
@@ -136,6 +141,9 @@ class OrderCreate(BaseModel):
     discount: float = Field(ge=0)
     total: float = Field(ge=0)
     couponCode: str | None = None
+    # References from /api/orders/whatsapp-message, so the saved order matches the WhatsApp message the store got.
+    orderId: str | None = Field(default=None, pattern=ORDER_ID_PATTERN)
+    trackingId: str | None = Field(default=None, pattern=TRACKING_ID_PATTERN)
 
 
 class OrderUpdate(BaseModel):
@@ -365,18 +373,68 @@ def design_upload_id(url: str | None) -> str | None:
     return image_id if re.fullmatch(r"[0-9a-f]{32}", image_id) else None
 
 
+def new_order_ids() -> dict[str, str]:
+    return {
+        "orderId": f"CM-{datetime.now(timezone.utc):%Y%m%d%H%M%S}-{uuid4().hex[:4].upper()}",
+        "trackingId": f"TRK-{uuid4().hex[:10].upper()}",
+    }
+
+
+def requested_stock_of(order: OrderCreate) -> Counter[str]:
+    # Made-to-order custom tees are not catalogue products, so they have no stock to reserve.
+    requested: Counter[str] = Counter()
+    for item in order.items:
+        if not item.productId.startswith(CUSTOM_PRODUCT_PREFIX):
+            requested[item.productId] += item.quantity
+    return requested
+
+
+def reject_blocked_customer(order: OrderCreate) -> None:
+    email = order.customerEmail.strip().lower()
+    customers = require_resource_collection(customers_collection, "customers")
+    if email and customers.find_one({"email": email, "status": "blocked"}, {"_id": 1}):
+        raise HTTPException(status_code=403, detail="This account can't place orders. Please contact support.")
+
+
+@app.post("/api/orders/whatsapp-message")
+def prepare_whatsapp_order(order: OrderCreate) -> dict[str, Any]:
+    """Step before placing an order: checks it, assigns its references and returns the pre-filled WhatsApp link.
+
+    Nothing is saved and no stock is held. The customer sends the message, then confirms through POST /api/orders
+    with the same orderId / trackingId, so the saved order matches what the store received.
+    """
+    products = require_collection()
+    reject_blocked_customer(order)
+    for product_id, quantity in requested_stock_of(order).items():
+        if products.find_one({"id": product_id, "active": True, "stock": {"$gte": quantity}}, {"_id": 1}) is None:
+            raise HTTPException(status_code=409, detail=f"Not enough stock available for product {product_id}.")
+    coupon_code = order.couponCode.strip().upper() if order.couponCode else None
+    if coupon_code and require_resource_collection(coupons_collection, "coupons").find_one({**available_coupon_filter(), "code": coupon_code}, {"_id": 1}) is None:
+        raise HTTPException(status_code=409, detail=f"Coupon {coupon_code} is no longer valid. Remove it and try again.")
+    owner_number = to_whatsapp_number(owner_whatsapp_phone())
+    if not owner_number:
+        raise HTTPException(status_code=503, detail="The store's WhatsApp number isn't set up yet. Please contact support.")
+
+    document = order.model_dump()
+    checkout_images = [item.pop("image", None) for item in document["items"]]
+    document.update({**new_order_ids(), "couponCode": coupon_code, "paymentStatus": "pending", "createdAt": datetime.now(timezone.utc)})
+    image_links = order_image_links(document, order_item_images(document, checkout_images))
+    return {
+        "orderId": document["orderId"],
+        "trackingId": document["trackingId"],
+        "whatsappUrl": f"https://wa.me/{owner_number}?text={quote(build_order_text(document, image_links))}",
+    }
+
+
 @app.post("/api/orders", status_code=status.HTTP_201_CREATED)
 def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[str, Any]:
     collection = require_orders_collection()
     products = require_collection()
     customers = require_resource_collection(customers_collection, "customers")
-    if customers.find_one({"email": order.customerEmail.lower(), "status": "blocked"}, {"_id": 1}):
-        raise HTTPException(status_code=403, detail="This account can't place orders. Please contact support.")
-    # Made-to-order custom tees are not catalogue products, so they have no stock to reserve.
-    stocked_items = [item for item in order.items if not item.productId.startswith(CUSTOM_PRODUCT_PREFIX)]
-    requested_stock = Counter(item.productId for item in stocked_items)
-    for item in stocked_items:
-        requested_stock[item.productId] += item.quantity - 1
+    reject_blocked_customer(order)
+    if order.trackingId and collection.find_one({"trackingId": order.trackingId}, {"_id": 1}):
+        raise HTTPException(status_code=409, detail="This order has already been placed.")
+    requested_stock = requested_stock_of(order)
 
     adjusted_products: list[tuple[str, int]] = []
     for product_id, quantity in requested_stock.items():
@@ -410,29 +468,43 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
 
     document = order.model_dump()
     document["couponCode"] = coupon_code
+    document["customerEmail"] = order.customerEmail.strip().lower()
     # Checkout sends each photo inline for the WhatsApp alert only; keep it out of the stored order.
     checkout_images = [item.pop("image", None) for item in document["items"]]
+    ids = new_order_ids()
     document.update(
         {
-            "orderId": f"CM-{datetime.now(timezone.utc):%Y%m%d%H%M%S}",
-            "trackingId": f"TRK-{uuid4().hex[:10].upper()}",
+            "orderId": order.orderId or ids["orderId"],
+            "trackingId": order.trackingId or ids["trackingId"],
             "status": "placed",
             "paymentStatus": "pending",
             "createdAt": datetime.now(timezone.utc),
         }
     )
-    try:
-        collection.insert_one(document)
-        customers.update_one(
-            {"email": order.customerEmail.lower()},
-            {"$set": {"name": order.customerName, "phone": order.phone, "updatedAt": document["createdAt"]}, "$setOnInsert": {"email": order.customerEmail.lower(), "createdAt": document["createdAt"]}},
-            upsert=True,
-        )
-    except PyMongoError as error:
+
+    def undo_reservations() -> None:
         restore_stock()
         if coupon_code:
             coupons_collection.update_one({"code": coupon_code}, {"$inc": {"usedCount": -1}})
+
+    try:
+        collection.insert_one(document)
+    except DuplicateKeyError as error:
+        # Confirm tapped twice: the first tap already placed this order.
+        undo_reservations()
+        raise HTTPException(status_code=409, detail="This order has already been placed.") from error
+    except PyMongoError as error:
+        undo_reservations()
         raise HTTPException(status_code=409, detail=f"Could not create order: {error}") from error
+    if document["customerEmail"]:
+        try:
+            customers.update_one(
+                {"email": document["customerEmail"]},
+                {"$set": {"name": order.customerName, "phone": order.phone, "updatedAt": document["createdAt"]}, "$setOnInsert": {"email": document["customerEmail"], "createdAt": document["createdAt"]}},
+                upsert=True,
+            )
+        except PyMongoError:
+            logging.getLogger(__name__).warning("Order %s: could not update the customer record.", document["orderId"])
     document.pop("_id", None)
     # Tie the customer's uploaded pictures to this order so they can be told apart from abandoned uploads.
     artwork_ids = [image_id for image_id in (design_upload_id(item.get("artworkUrl")) for item in document["items"]) if image_id]
@@ -443,10 +515,6 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks) -> dict[
             logging.getLogger(__name__).warning("Order %s: could not link uploaded pictures.", document["orderId"])
     image_links = order_image_links(document, order_item_images(document, checkout_images))
     background_tasks.add_task(notify_owner_of_order, dict(document), image_links)
-    # Click-to-chat link: the customer sends the order (with photo links) to the owner's WhatsApp in one tap.
-    owner_number = to_whatsapp_number(owner_whatsapp_phone())
-    if owner_number:
-        document["whatsappUrl"] = f"https://wa.me/{owner_number}?text={quote(build_order_text(document, image_links))}"
     return document
 
 
@@ -475,10 +543,20 @@ def order_image_links(order: dict[str, Any], candidates: list[list[str]]) -> lis
     """One public JPEG/PNG link per item for WhatsApp to download.
 
     Inline photos (data URLs) are saved and served from /api/order-images/{id}; public URLs are used as they are.
+    Photos already saved for this order (when its WhatsApp message was prepared) are reused.
     """
     base = public_base_url()
+    saved: dict[int, str] = {}
+    if base and order_images_collection is not None:
+        try:
+            saved = {doc["item"]: doc["id"] for doc in order_images_collection.find({"orderId": order["orderId"], "item": {"$exists": True}}, {"_id": 0, "id": 1, "item": 1})}
+        except PyMongoError:
+            pass
     links: list[str | None] = []
-    for sources in candidates:
+    for index, sources in enumerate(candidates):
+        if index in saved:
+            links.append(f"{base}{ORDER_IMAGE_PATH}{saved[index]}")
+            continue
         link = None
         for source in sources:
             match = DATA_IMAGE_PATTERN.match(source)
@@ -486,7 +564,7 @@ def order_image_links(order: dict[str, Any], candidates: list[list[str]]) -> lis
                 image_id = uuid4().hex
                 try:
                     order_images_collection.insert_one(
-                        {"id": image_id, "orderId": order["orderId"], "mime": "image/png" if match.group(1) == "png" else "image/jpeg", "data": base64.b64decode(match.group(2)), "createdAt": order["createdAt"]}
+                        {"id": image_id, "orderId": order["orderId"], "item": index, "mime": "image/png" if match.group(1) == "png" else "image/jpeg", "data": base64.b64decode(match.group(2)), "createdAt": order["createdAt"]}
                     )
                 except (PyMongoError, ValueError):
                     continue
